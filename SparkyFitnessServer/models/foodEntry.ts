@@ -1226,7 +1226,7 @@ async function bulkCreateFoodEntriesWithClient(
 async function bulkCreateFoodEntries(
   entriesData: FoodEntryInput[],
   authenticatedUserId: string,
-  options?: { copiedSnapshots: boolean }
+  options?: { copiedSnapshots?: boolean; client?: PoolClient }
 ) {
   log(
     'info',
@@ -1234,18 +1234,20 @@ async function bulkCreateFoodEntries(
   );
   // For bulk create, assuming all entries belong to the same user,
   // and the first entry's user_id can be used for RLS context.
-  const client: PoolClient = await getClient(authenticatedUserId); // User-specific operation
+  const providedClient = options?.client;
+  const client: PoolClient =
+    providedClient ?? (await getClient(authenticatedUserId)); // User-specific operation
   let releaseError: Error | undefined;
   let transactionStarted = false;
   try {
-    if (options?.copiedSnapshots) {
+    if (options?.copiedSnapshots && !providedClient) {
       await client.query('BEGIN');
       transactionStarted = true;
     }
     const result = await bulkCreateFoodEntriesWithClient(
       client,
       entriesData,
-      options
+      options?.copiedSnapshots ? { copiedSnapshots: true } : undefined
     );
     if (transactionStarted) await client.query('COMMIT');
     return result;
@@ -1262,7 +1264,7 @@ async function bulkCreateFoodEntries(
     }
     throw error;
   } finally {
-    client.release(releaseError);
+    if (!providedClient) client.release(releaseError);
   }
 }
 async function getFoodEntryComponentsByFoodEntryMealId(
@@ -1325,13 +1327,14 @@ async function getFoodEntryComponentsByFoodEntryMealId(
 }
 async function deleteFoodEntryComponentsByFoodEntryMealId(
   foodEntryMealId: string,
-  userId: string
+  userId: string,
+  providedClient?: PoolClient
 ) {
   log(
     'info',
     `deleteFoodEntryComponentsByFoodEntryMealId in foodEntry.js: foodEntryMealId: ${foodEntryMealId}, userId: ${userId}`
   );
-  const client = await getClient(userId);
+  const client = providedClient ?? (await getClient(userId));
   try {
     const result = await client.query(
       'DELETE FROM food_entries WHERE food_entry_meal_id = $1 RETURNING id',
@@ -1339,7 +1342,7 @@ async function deleteFoodEntryComponentsByFoodEntryMealId(
     );
     return result.rowCount > 0;
   } finally {
-    client.release();
+    if (!providedClient) client.release();
   }
 }
 
