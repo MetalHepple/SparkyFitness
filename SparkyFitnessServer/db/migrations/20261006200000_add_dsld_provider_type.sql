@@ -25,7 +25,8 @@ SET categories = ARRAY['supplement'],
     supports_barcode = TRUE
 WHERE id = 'dsld';
 
--- 2. Add it to the providers every new instance gets (keeps the existing entries)
+-- 2. Keep the new provider private and disabled until the admin opts in.
+-- Existing providers and their sharing settings remain unchanged.
 CREATE OR REPLACE FUNCTION public.create_global_default_providers(p_admin_user_id uuid)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
@@ -68,8 +69,8 @@ BEGIN
   INSERT INTO public.external_data_providers (
     user_id, provider_name, provider_type, is_active, is_public, created_at, updated_at
   ) VALUES (
-    p_admin_user_id, 'NIH Dietary Supplement Label Database', 'dsld', TRUE, TRUE, now(), now()
-  ) ON CONFLICT (user_id, provider_name) DO UPDATE SET is_public = TRUE;
+    p_admin_user_id, 'NIH Dietary Supplement Label Database', 'dsld', FALSE, FALSE, now(), now()
+  ) ON CONFLICT (user_id, provider_name) DO NOTHING;
 END;
 $$;
 
@@ -83,8 +84,8 @@ BEGIN
     INSERT INTO public.external_data_providers (
       user_id, provider_name, provider_type, is_active, is_public, created_at, updated_at
     ) VALUES (
-      v_admin_id, 'NIH Dietary Supplement Label Database', 'dsld', TRUE, TRUE, now(), now()
-    ) ON CONFLICT (user_id, provider_name) DO UPDATE SET is_public = TRUE;
+      v_admin_id, 'NIH Dietary Supplement Label Database', 'dsld', FALSE, FALSE, now(), now()
+    ) ON CONFLICT (user_id, provider_name) DO NOTHING;
   END IF;
 END $$;
 
