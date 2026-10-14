@@ -247,6 +247,7 @@ npx expo prebuild --clean
 - `chatApi.ts` is history persistence only: `GET /api/chat/sparky-chat-history` and `POST /api/chat/clear-all-history`. `useChatHistory` seeds the runtime with prior messages and uses `staleTime`/`gcTime` of 0 because the runtime ignores `messages` changes after mount — every chat open must re-seed cold.
 - `useChatBackgroundRecovery.ts` tracks a unique ID per generation (including retries), watches app-state changes, and polls saved history on foreground return after an interrupted turn. A background stream ending without a protocol finish reason still needs recovery: Android may report a clean EOF for a broken connection. Android's `expo/fetch` can also reject the response with an empty error message; recover that case only after backgrounding. An explicit stop or confirmed finish releases the pending turn. The server persists that ID as `metadata.client_message_id` and consumes the provider stream independently of the phone. Recovery remounts the thread with the saved transcript and never resends a potentially mutating AI request. The screen stays awake only while a live reply runs.
 - Chat UI lives in `components/chat/`: `MarkdownMessage` (`react-native-enriched-markdown` + `remend` to repair unclosed streamed markdown), `ToolCallCard` (derives running/complete/error from `result`/`isError`), `TypingIndicator`. Tool-name display mapping lives in `constants/chat.ts`.
+- `FoodAssistantStatePanel`, `useFoodAssistantState` and `foodAssistantApi` expose private preferences and task checkpoints/history, versioned edit/forget/cancel/resume and resume as a normal user chat message. They remain separate from chat history.
 - There is no chat Zustand store; thread state lives in the assistant-ui runtime and history seeding in React Query.
 
 ## Auth, Networking, And Settings
@@ -334,6 +335,8 @@ npx expo prebuild --clean
 
 ## Server API Orientation
 
+Shopping checklists in `components/chat/FoodAssistantStatePanel.tsx` use `hooks/useFoodAssistantState.ts` and `services/api/foodAssistantApi.ts`. Checks are owner-only, versioned task edits. Chat publication of verified plans uses the ordinary meal-plan and diary invalidation family.
+
 All endpoints require auth headers, and proxy headers are injected before auth headers when configured. Key mobile clients:
 
 - `healthDataApi.ts` - `POST /api/health-data`, identity checks, chunking, timeout, retry, session-expiry handling.
@@ -345,6 +348,7 @@ All endpoints require auth headers, and proxy headers are injected before auth h
 - `fastingApi.ts` - `POST /api/fasting/start`, `POST /api/fasting/end`, current/stats/history/range reads, and `GET/PUT /api/fasting/preferences`.
 - `authService.ts`, `profileApi.ts`, `externalProvidersApi.ts`, `customNutrientsApi.ts` - auth/session/MFA, profile, configured providers, custom nutrient definitions.
 - `ChatScreen.tsx` (transport) + `chatApi.ts` - streaming chat via `POST /api/chat/stream`, history load/clear.
+- `hooks/invalidateAssistantFoodCaches.ts` - refresh diary, library, recipe, meal-plan and assistant-state caches after a chat turn; reuses the ordinary food and meal invalidation helpers.
 
 When reviewing an API issue, trace screen/hook -> API client -> server route -> service/repository -> shared schema before judging the fix. Deeper endpoint docs live in mobile `docs/` (`food_api.md`, `sync_api.md`, `measurements_api.md`, `external_providers.md`, `healthkit.md`, `bg_sync.md`).
 

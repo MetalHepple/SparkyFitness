@@ -76,7 +76,7 @@ import {
   stepCountIs,
   hasToolCall,
 } from 'ai';
-import type { JSONValue, LanguageModelUsage, UIMessageChunk } from 'ai';
+import type { JSONValue, LanguageModelUsage, UIMessageChunk, Tool } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -102,6 +102,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const MAX_AGENTIC_STEPS = 15;
+// Verified recipe/plan work can require several source lookups, checkpoints
+// and readbacks. Full-profile food turns get room to finish those workflows.
+const FOOD_WORKFLOW_MAX_AGENTIC_STEPS = 48;
 // Tighter agent-loop ceiling for the 'core' profile (small/local models with
 // no prompt cache): every step re-processes the full prefix from scratch, so
 // 15 runaway steps on a confused 3B model is pure token burn. Core-profile
@@ -131,6 +134,7 @@ const CORE_PROFILE_MAX_PROVIDER_RETRIES = 1;
 // providerDispatch.ts). Generous: a slow local model streaming a long answer
 // with several tool round-trips can legitimately take minutes.
 const CHAT_REQUEST_TIMEOUT_MS = 5 * 60_000;
+const FOOD_WORKFLOW_TIMEOUT_MS = 15 * 60_000;
 
 async function handleAiServiceSettings(
   action: string,
@@ -463,13 +467,37 @@ const chatContextInputsCache = new TtlCache<{
 //   turn is over — without this the echoed tool result would come straight back
 //   and the model would answer its own question. Harmless on the non-streaming
 //   path (no chip UI there): the question simply degrades to plain text.
-export function buildChatStopConditions(toolProfile: ChatToolProfile) {
+function chatWorkflowBudget(
+  toolProfile: ChatToolProfile,
+  foodWorkflows: boolean
+) {
+  return toolProfile === 'full' && foodWorkflows
+    ? {
+        steps: FOOD_WORKFLOW_MAX_AGENTIC_STEPS,
+        timeout: FOOD_WORKFLOW_TIMEOUT_MS,
+      }
+    : {
+        steps:
+          toolProfile === 'core'
+            ? CORE_PROFILE_MAX_AGENTIC_STEPS
+            : MAX_AGENTIC_STEPS,
+        timeout: CHAT_REQUEST_TIMEOUT_MS,
+      };
+}
+function hasFoodWorkflows(
+  activeTools: readonly string[] | undefined,
+  tools: Record<string, unknown>
+) {
+  return (activeTools ?? Object.keys(tools)).includes(
+    'sparky_food_assistant_state'
+  );
+}
+export function buildChatStopConditions(
+  toolProfile: ChatToolProfile,
+  foodWorkflows = false
+) {
   return [
-    stepCountIs(
-      toolProfile === 'core'
-        ? CORE_PROFILE_MAX_AGENTIC_STEPS
-        : MAX_AGENTIC_STEPS
-    ),
+    stepCountIs(chatWorkflowBudget(toolProfile, foodWorkflows).steps),
     hasToolCall(ASK_USER_TOOL_NAME),
   ];
 }
@@ -523,7 +551,9 @@ async function prepareChatContext(
   categoriesAreManual = false,
   serviceSystemPrompt?: string | null,
   latestImageDataUrl?: string | null,
-  serviceConfigId?: string | null
+  serviceConfigId?: string | null,
+  foodResearchTool?: Tool,
+  latestUserText?: string
 ) {
   const { chatTz, customCategoriesList } =
     await chatContextInputsCache.getOrLoad(authenticatedUserId, async () => {
@@ -585,6 +615,8 @@ async function prepareChatContext(
     foodPhotoEstimateSink,
     latestImageDataUrl,
     serviceConfigId,
+    foodResearchTool,
+    latestUserText,
   };
 
   if (categoriesAreManual) {
@@ -751,6 +783,12 @@ export function getSystemPrompt(
     if (existsSync(foodPath)) {
       content += '\n\n' + readFileSync(foodPath, 'utf-8').trim();
     }
+    content +=
+      '\n\n' +
+      readFileSync(
+        path.join(__dirname, '../prompts/chatbot-food-planning.md'),
+        'utf-8'
+      ).trim();
   }
 
   if (categories.has('vision') && suffix === 'full') {
@@ -819,7 +857,8 @@ const RETENTION_24H_MODEL_PREFIXES = [
 export function buildChatProviderOptions(
   serviceType: string,
   userId: string,
-  modelName: string
+  modelName: string,
+  reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' = 'medium'
 ): Record<string, Record<string, JSONValue>> | undefined {
   if (serviceType === 'openai_compatible') {
     return { openai: { systemMessageMode: 'system' } };
@@ -828,6 +867,11 @@ export function buildChatProviderOptions(
   const openai: Record<string, JSONValue> = {
     promptCacheKey: `sparky-chat-${userId}`,
   };
+  if (/^gpt-6(?:[.-]|$)/.test(modelName)) {
+    openai.reasoningEffort = reasoningEffort;
+    openai.promptCacheOptions = { ttl: '30m' };
+    openai.store = false;
+  }
   if (RETENTION_24H_MODEL_PREFIXES.some((p) => modelName.startsWith(p))) {
     openai.promptCacheRetention = '24h';
   }
@@ -1675,7 +1719,9 @@ function toCoreMessages(messages: ChatMessage[]): LlmMessage[] {
  * Extracts the latest image data URL or base64 payload from the most recent
  * user turn in the conversation history, if any.
  */
-function extractLatestImageDataUrl(messages: ChatMessage[]): string | null {
+export function extractLatestImageDataUrl(
+  messages: ChatMessage[]
+): string | null {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const msg = messages[i];
     if (msg.role !== 'user') continue;
@@ -1684,7 +1730,7 @@ function extractLatestImageDataUrl(messages: ChatMessage[]): string | null {
       : Array.isArray(msg.content)
         ? (msg.content as ChatMessagePart[])
         : null;
-    if (!partsSource) continue;
+    if (!partsSource) return null;
     for (const part of partsSource) {
       if (
         part.type === 'image' ||
@@ -1700,6 +1746,7 @@ function extractLatestImageDataUrl(messages: ChatMessage[]): string | null {
         }
       }
     }
+    return null;
   }
   return null;
 }
@@ -2050,13 +2097,25 @@ async function processChatMessage(
       categoriesAreManual,
       aiService.system_prompt,
       latestImageDataUrl,
-      aiService.id
+      aiService.id,
+      aiService.service_type === 'openai' && /^gpt-6(?:[.-]|$)/.test(modelName)
+        ? createOpenAI({ apiKey: aiService.api_key }).tools.webSearch({
+            searchContextSize: 'high',
+          })
+        : undefined,
+      extractMessageText(
+        [...messages].reverse().find((message) => message.role === 'user') ?? {
+          role: 'user',
+          content: '',
+        }
+      )
     );
 
     const chatProviderOptions = buildChatProviderOptions(
       aiService.service_type,
       authenticatedUserId,
-      modelName
+      modelName,
+      aiService.reasoning_effort
     );
 
     // Map conversation history messages to CoreMessage format, then apply the
@@ -2096,12 +2155,20 @@ async function processChatMessage(
             }),
           // Tighter retry ceiling for cache-less core-profile backends, where every
           // retry re-processes the full prefix.
-          stopWhen: buildChatStopConditions(toolProfile),
+          stopWhen: buildChatStopConditions(
+            toolProfile,
+            hasFoodWorkflows(activeToolNames, tools)
+          ),
           maxRetries:
             toolProfile === 'core'
               ? CORE_PROFILE_MAX_PROVIDER_RETRIES
               : MAX_PROVIDER_RETRIES,
-          abortSignal: AbortSignal.timeout(CHAT_REQUEST_TIMEOUT_MS),
+          abortSignal: AbortSignal.timeout(
+            chatWorkflowBudget(
+              toolProfile,
+              hasFoodWorkflows(activeToolNames, tools)
+            ).timeout
+          ),
           onStepFinish({ toolCalls, toolResults }) {
             if (toolCalls && toolCalls.length > 0) {
               toolCalls.forEach((call) => {
@@ -2155,38 +2222,9 @@ async function processChatMessage(
 
     let finalContent = result.text.trim();
     if (!finalContent) {
-      if (executedToolsList.length > 0) {
-        const lastTool = executedToolsList[executedToolsList.length - 1];
-        if (lastTool.name === 'sparky_manage_food') {
-          if (lastTool.args?.action === 'log_water') {
-            finalContent = "I've logged your water intake.";
-          } else {
-            finalContent = "I've logged that food for you.";
-          }
-        } else if (lastTool.name === 'sparky_manage_exercise') {
-          finalContent = "I've logged your exercise.";
-        } else if (lastTool.name === 'sparky_manage_checkin') {
-          if (lastTool.args?.action === 'log_mood') {
-            finalContent = "I've recorded your mood.";
-          } else if (lastTool.args?.action === 'log_sleep') {
-            finalContent = "I've logged your sleep.";
-          } else if (lastTool.args?.action === 'log_biometrics') {
-            finalContent = "I've updated your biometrics.";
-          } else if (lastTool.args?.action === 'log_fasting') {
-            finalContent = "I've logged your fasting window.";
-          } else {
-            finalContent = "I've updated your wellness diary.";
-          }
-        } else {
-          finalContent = "I've recorded that for you!";
-        }
-        log(
-          'info',
-          `[chat] LLM returned empty text; generated generic fallback confirmation: "${finalContent}"`
-        );
-      } else {
-        finalContent = EMPTY_RESPONSE_ERROR_TEXT;
-      }
+      // A tool call can fail or only search. Its name never proves a write.
+      // Preserve the actual result instead of claiming a food was logged.
+      finalContent = toolOutputs.at(-1)?.trim() || EMPTY_RESPONSE_ERROR_TEXT;
     }
 
     if (finalContent) {
@@ -2370,6 +2408,7 @@ async function testAiServiceConnection(
   let apiKey = payload.api_key?.trim() || undefined;
   let customUrl = payload.custom_url?.trim() || undefined;
   let modelName = payload.model_name?.trim() || undefined;
+  let reasoningEffort = payload.reasoning_effort;
 
   // Stored-key fallback: the api_key field is blank by design on edit (the key
   // is encrypted server-side and never sent to the browser), so a test on a
@@ -2398,6 +2437,8 @@ async function testAiServiceConnection(
         apiKey = stored.api_key ?? undefined;
         customUrl = customUrl ?? stored.custom_url ?? undefined;
         modelName = modelName ?? stored.model_name ?? undefined;
+        reasoningEffort =
+          reasoningEffort ?? stored.reasoning_effort ?? undefined;
       }
     }
   }
@@ -2438,6 +2479,7 @@ async function testAiServiceConnection(
     api_key: apiKey,
     model_name: modelName,
     custom_url: customUrl,
+    reasoning_effort: reasoningEffort,
   };
 
   const result = await dispatchAiRequest({
@@ -2594,13 +2636,25 @@ async function processChatMessageStream(
       categoriesAreManual,
       aiService.system_prompt,
       latestImageDataUrl,
-      aiService.id
+      aiService.id,
+      aiService.service_type === 'openai' && /^gpt-6(?:[.-]|$)/.test(modelName)
+        ? createOpenAI({ apiKey: aiService.api_key }).tools.webSearch({
+            searchContextSize: 'high',
+          })
+        : undefined,
+      extractMessageText(
+        [...messages].reverse().find((message) => message.role === 'user') ?? {
+          role: 'user',
+          content: '',
+        }
+      )
     );
 
     const chatProviderOptions = buildChatProviderOptions(
       aiService.service_type,
       authenticatedUserId,
-      modelName
+      modelName,
+      aiService.reasoning_effort
     );
 
     // Map client messages to CoreMessage format, then apply the shared
@@ -2668,12 +2722,20 @@ async function processChatMessageStream(
       },
       // Tighter retry ceiling for cache-less core-profile backends, where every
       // retry re-processes the full prefix.
-      stopWhen: buildChatStopConditions(toolProfile),
+      stopWhen: buildChatStopConditions(
+        toolProfile,
+        hasFoodWorkflows(activeToolNames, tools)
+      ),
       maxRetries:
         toolProfile === 'core'
           ? CORE_PROFILE_MAX_PROVIDER_RETRIES
           : MAX_PROVIDER_RETRIES,
-      abortSignal: AbortSignal.timeout(CHAT_REQUEST_TIMEOUT_MS),
+      abortSignal: AbortSignal.timeout(
+        chatWorkflowBudget(
+          toolProfile,
+          hasFoodWorkflows(activeToolNames, tools)
+        ).timeout
+      ),
       onStepFinish({ toolResults }) {
         if (toolResults && toolResults.length > 0) {
           const sizes = toolResults
@@ -2688,6 +2750,7 @@ async function processChatMessageStream(
         usage,
         totalUsage,
         toolCalls,
+        sources,
       }) => {
         const observedUsage = totalUsage ?? usage;
         log(
@@ -2746,6 +2809,15 @@ async function processChatMessageStream(
 
         const assistantParts: Record<string, unknown>[] = [];
         if (text.trim()) assistantParts.push({ type: 'text', text });
+        for (const source of sources ?? []) {
+          if (source.sourceType === 'url')
+            assistantParts.push({
+              type: 'source-url',
+              sourceId: source.id,
+              url: source.url,
+              title: source.title,
+            });
+        }
         if (capturedEstimate) {
           assistantParts.push({
             type: FOOD_PHOTO_ESTIMATE_PART_TYPE,
@@ -2792,6 +2864,7 @@ async function processChatMessageStream(
     return {
       stream: withEmptyCompletionGuard(
         result.toUIMessageStream({
+          sendSources: true,
           messageMetadata: ({ part }) =>
             part.type === 'finish'
               ? mapUsageToMetadata(part.totalUsage)
